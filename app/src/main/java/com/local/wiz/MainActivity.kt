@@ -57,12 +57,14 @@ object Wiz {
 class MainActivity : ComponentActivity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        cm.requestNetwork(
-            NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(),
-            object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(n: Network) { Wiz.network = n; cm.bindProcessToNetwork(n) }
-            })
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.requestNetwork(
+                NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(),
+                object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(n: Network) { Wiz.network = n; cm.bindProcessToNetwork(n) }
+                })
+        } catch (e: Exception) {}
         val prefs = getSharedPreferences("bulbs", MODE_PRIVATE)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(
