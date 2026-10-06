@@ -143,12 +143,22 @@ data class ThemeSpec(
     val offset: Boolean
 )
 
-val modeNames = listOf("Fade", "Snap", "Flicker", "Pulse")
+val modeNames = listOf(
+    "Fade", "Snap", "Flicker", "Pulse", "Strobe", "Heartbeat",
+    "Chase", "Random jump", "Ping-pong", "Sunrise", "Lightning"
+)
 val modeHelp = listOf(
     "Colors blend smoothly into the next one",
     "Jumps straight to the next color",
     "Flickers like a candle or fire",
-    "Breathes brighter and dimmer"
+    "Breathes brighter and dimmer",
+    "Quick on-off flashes of each color",
+    "Double beat, then a pause, like a pulse",
+    "The color runs from bulb to bulb (needs 2 or more bulbs)",
+    "A random color from your list each time",
+    "Goes forward through the colors, then backward",
+    "Slowly gets brighter across the colors, then repeats",
+    "Dim glow with sudden bright flashes at random"
 )
 
 fun enc(t: ThemeSpec): String {
@@ -177,22 +187,42 @@ suspend fun runTheme(t: ThemeSpec, ips: () -> List<String>) {
         val shift = if (t.offset) i else 0
         return t.colors[(s + shift) % n]
     }
+    fun ping(s: Int): Int {
+        if (n < 2) return 0
+        val m = s % (2 * n - 2)
+        return if (m < n) m else 2 * n - 2 - m
+    }
+    fun pcol(i: Int, s: Int): Int {
+        val shift = if (t.offset) i else 0
+        return t.colors[ping(s + shift)]
+    }
+    suspend fun fadeStep(
+        list: List<String>,
+        a: (Int) -> Int,
+        b: (Int) -> Int,
+        bright: (Float) -> Int
+    ) {
+        val slices = (totalMs / 200).toInt().coerceAtLeast(1)
+        for (k in 1..slices) {
+            val f = k / slices.toFloat()
+            list.forEachIndexed { i, ip ->
+                setRgb(ip, mix(a(i), b(i), f), bright(f), 1)
+            }
+            delay(totalMs / slices)
+        }
+    }
     var step = 0
     while (true) {
         val list = ips()
+        if (list.isEmpty()) {
+            delay(500)
+            continue
+        }
+        val s = step
         when (t.mode) {
-            0 -> {
-                val slices = (totalMs / 200).toInt().coerceAtLeast(1)
-                for (k in 1..slices) {
-                    list.forEachIndexed { i, ip ->
-                        val c = mix(col(i, step), col(i, step + 1), k / slices.toFloat())
-                        setRgb(ip, c, t.dim, 1)
-                    }
-                    delay(totalMs / slices)
-                }
-            }
+            0 -> fadeStep(list, { i -> col(i, s) }, { i -> col(i, s + 1) }, { _ -> t.dim })
             1 -> {
-                list.forEachIndexed { i, ip -> setRgb(ip, col(i, step), t.dim, 2) }
+                list.forEachIndexed { i, ip -> setRgb(ip, col(i, s), t.dim, 2) }
                 delay(totalMs)
             }
             2 -> {
@@ -200,22 +230,79 @@ suspend fun runTheme(t: ThemeSpec, ips: () -> List<String>) {
                 while (System.currentTimeMillis() < end) {
                     list.forEachIndexed { i, ip ->
                         val b = (10..t.dim.coerceAtLeast(11)).random()
-                        setRgb(ip, col(i, step), b, 1)
+                        setRgb(ip, col(i, s), b, 1)
                     }
                     delay((60..220).random().toLong())
                 }
             }
-            else -> {
+            3 -> {
                 val slices = (totalMs / 150).toInt().coerceAtLeast(2)
                 for (k in 0 until slices) {
                     val range = (t.dim - 10).coerceAtLeast(0)
                     val b = (10 + range * sin(PI * k / slices)).toInt().coerceIn(10, 100)
-                    list.forEachIndexed { i, ip -> setRgb(ip, col(i, step), b, 1) }
+                    list.forEachIndexed { i, ip -> setRgb(ip, col(i, s), b, 1) }
                     delay(totalMs / slices)
                 }
             }
+            4 -> {
+                val end = System.currentTimeMillis() + totalMs
+                while (System.currentTimeMillis() < end) {
+                    list.forEachIndexed { i, ip -> setRgb(ip, col(i, s), t.dim, 1) }
+                    delay(70)
+                    list.forEach { Wiz.send(it, pilot("\"state\":false"), 1) }
+                    delay(110)
+                }
+            }
+            5 -> {
+                val t0 = System.currentTimeMillis()
+                repeat(2) {
+                    list.forEachIndexed { i, ip -> setRgb(ip, col(i, s), t.dim, 1) }
+                    delay(110)
+                    list.forEachIndexed { i, ip -> setRgb(ip, col(i, s), 10, 1) }
+                    delay(130)
+                }
+                val left = totalMs - (System.currentTimeMillis() - t0)
+                if (left > 0) delay(left)
+            }
+            6 -> {
+                val sub = (totalMs / list.size).coerceAtLeast(100L)
+                list.indices.forEach { j ->
+                    list.forEachIndexed { i, ip ->
+                        setRgb(ip, col(0, s), if (i == j) t.dim else 10, 1)
+                    }
+                    delay(sub)
+                }
+            }
+            7 -> {
+                list.forEach { ip -> setRgb(ip, t.colors.random(), t.dim, 2) }
+                delay(totalMs)
+            }
+            8 -> fadeStep(list, { i -> pcol(i, s) }, { i -> pcol(i, s + 1) }, { _ -> t.dim })
+            9 -> fadeStep(
+                list,
+                { i -> col(i, s) },
+                { i -> col(i, s + 1) },
+                { f ->
+                    val range = (t.dim - 10).coerceAtLeast(0)
+                    (10 + range * (((s % n) + f) / n)).toInt()
+                }
+            )
+            10 -> {
+                val end = System.currentTimeMillis() + totalMs
+                list.forEachIndexed { i, ip -> setRgb(ip, col(i, s), 10, 1) }
+                while (System.currentTimeMillis() < end) {
+                    delay((300..1500).random().toLong())
+                    repeat((1..3).random()) {
+                        list.forEachIndexed { i, ip -> setRgb(ip, col(i, s), 100, 1) }
+                        delay((60..120).random().toLong())
+                        list.forEachIndexed { i, ip -> setRgb(ip, col(i, s), 10, 1) }
+                        delay((60..140).random().toLong())
+                    }
+                }
+            }
+            else -> delay(500)
         }
-        step = (step + 1) % n
+        step++
     }
 }
 
@@ -343,7 +430,7 @@ fun App(prefs: SharedPreferences) {
                 }
             }
             TabRow(selectedTabIndex = tab) {
-                listOf("Bulbs", "Sync", "Themes", "Setup").forEachIndexed { i, t ->
+                listOf("Bulbs", "Sync", "Themes").forEachIndexed { i, t ->
                     Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t) })
                 }
             }
@@ -409,7 +496,6 @@ fun App(prefs: SharedPreferences) {
                         SyncPanel(ips, favC, favW) { saveAll() }
                     }
                 }
-                3 -> SetupLab(lm)
                 else -> LazyColumn(
                     lm,
                     contentPadding = PaddingValues(16.dp),
@@ -454,9 +540,15 @@ fun App(prefs: SharedPreferences) {
 }
 
 val scenes = listOf(
-    "Ocean" to 1, "Romance" to 2, "Sunset" to 3, "Party" to 4, "Fireplace" to 5,
-    "Cozy" to 6, "Forest" to 7, "Pastel" to 8, "Warm white" to 11, "Daylight" to 12,
-    "Cool white" to 13, "Night light" to 14, "Focus" to 16, "Relax" to 17
+    "Ocean" to 1, "Romance" to 2, "Sunset" to 3, "Party" to 4,
+    "Fireplace" to 5, "Cozy" to 6, "Forest" to 7, "Pastel colors" to 8,
+    "Wake up" to 9, "Bedtime" to 10, "Warm white" to 11, "Daylight" to 12,
+    "Cool white" to 13, "Night light" to 14, "Focus" to 15, "Relax" to 16,
+    "True colors" to 17, "TV time" to 18, "Plantgrowth" to 19, "Spring" to 20,
+    "Summer" to 21, "Fall" to 22, "Deepdive" to 23, "Jungle" to 24,
+    "Mojito" to 25, "Club" to 26, "Christmas" to 27, "Halloween" to 28,
+    "Candlelight" to 29, "Golden white" to 30, "Pulse" to 31,
+    "Steampunk" to 32, "Diwali" to 33
 )
 
 fun whiteColor(t: Float): Color {
@@ -471,6 +563,12 @@ class Ctl {
     var sat by mutableStateOf(1f)
     var temp by mutableStateOf(3000f)
     var fade by mutableStateOf(false)
+    var scene by mutableStateOf(0)
+    var speed by mutableStateOf(100f)
+}
+
+fun sceneParams(c: Ctl): String {
+    return "\"state\":true,\"sceneId\":${c.scene},\"speed\":${c.speed.toInt()}"
 }
 
 @Composable
@@ -543,10 +641,14 @@ fun Controls(
     onSave: () -> Unit
 ) {
     fun sendColor() {
+        c.scene = 0
         val k = android.graphics.Color.HSVToColor(floatArrayOf(c.hue, c.sat, 1f))
         send(rgbParams(k, c.dim.toInt()))
     }
-    fun sendWhite() = send("\"state\":true,\"temp\":${c.temp.toInt()},\"dimming\":${c.dim.toInt()}")
+    fun sendWhite() {
+        c.scene = 0
+        send("\"state\":true,\"temp\":${c.temp.toInt()},\"dimming\":${c.dim.toInt()}")
+    }
     LaunchedEffect(c.fade) {
         while (c.fade) {
             c.hue = (c.hue + 4) % 360
@@ -624,22 +726,36 @@ fun Controls(
         }
 
         Text(
-            "Scenes",
+            "Scenes (the bulb runs these itself)",
             style = MaterialTheme.typography.labelMedium,
             modifier = Modifier.padding(top = 8.dp)
         )
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             items(scenes) { (n, id) ->
-                AssistChip(
-                    onClick = { c.fade = false; send("\"state\":true,\"sceneId\":$id") },
+                FilterChip(
+                    selected = c.scene == id,
+                    onClick = {
+                        c.fade = false
+                        c.scene = id
+                        send(sceneParams(c))
+                    },
                     label = { Text(n) }
                 )
             }
         }
+        Text(
+            "Scene speed (${c.speed.toInt()})",
+            style = MaterialTheme.typography.labelMedium
+        )
+        Slider(
+            c.speed, { c.speed = it },
+            valueRange = 10f..200f,
+            onValueChangeFinished = { if (c.scene != 0) send(sceneParams(c)) }
+        )
         FilterChip(
             c.fade, { c.fade = !c.fade },
             label = { Text("Rainbow fade") },
-            modifier = Modifier.padding(top = 8.dp)
+            modifier = Modifier.padding(top = 4.dp)
         )
     }
 }
@@ -703,6 +819,10 @@ fun BulbCard(
             if (it.has("temp")) {
                 c.temp = it.optInt("temp", 3000).toFloat().coerceIn(2200f, 6500f)
             }
+            if (it.has("speed")) {
+                c.speed = it.optInt("speed", 100).toFloat().coerceIn(10f, 200f)
+            }
+            c.scene = it.optInt("sceneId", 0)
             if (it.has("r")) {
                 val hsv = FloatArray(3)
                 android.graphics.Color.RGBToHSV(it.optInt("r"), it.optInt("g"), it.optInt("b"), hsv)
@@ -779,7 +899,7 @@ fun ThemeCard(
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.padding(16.dp)) {
             Text(t.name, style = MaterialTheme.typography.titleMedium)
-            val mode = modeNames[t.mode.coerceIn(0, 3)]
+            val mode = modeNames[t.mode.coerceIn(0, modeNames.size - 1)]
             val secs = "%.1f".format(t.seconds)
             Text(
                 "${t.colors.size} colors · $mode · ${secs}s each",
@@ -860,7 +980,10 @@ fun ThemeEditor(initial: ThemeSpec?, onSave: (ThemeSpec) -> Unit, onCancel: () -
                     FilterChip(mode == i, { mode = i }, label = { Text(modeNames[i]) })
                 }
             }
-            Text(modeHelp[mode.coerceIn(0, 3)], style = MaterialTheme.typography.labelSmall)
+            Text(
+                modeHelp[mode.coerceIn(0, modeHelp.size - 1)],
+                style = MaterialTheme.typography.labelSmall
+            )
             Text(
                 "Each color lasts ${"%.1f".format(secs)} seconds",
                 style = MaterialTheme.typography.labelMedium
@@ -884,121 +1007,6 @@ fun ThemeEditor(initial: ThemeSpec?, onSave: (ThemeSpec) -> Unit, onCancel: () -
                     val nm = name.trim().ifBlank { "Theme" }.replace("~", "").replace("\n", " ")
                     onSave(ThemeSpec(nm, colors.toList(), secs, mode, dim.toInt(), offset))
                 }) { Text("Save theme") }
-            }
-        }
-    }
-}
-
-suspend fun rawSend(ip: String, msg: String): String {
-    return withContext(Dispatchers.IO) {
-        try {
-            DatagramSocket().use { s ->
-                Wiz.network?.bindSocket(s)
-                s.soTimeout = 2500
-                val d = msg.toByteArray()
-                val addr = InetAddress.getByName(ip)
-                s.send(DatagramPacket(d, d.size, addr, 38899))
-                val p = DatagramPacket(ByteArray(4096), 4096)
-                s.receive(p)
-                String(p.data, 0, p.length)
-            }
-        } catch (e: SocketTimeoutException) {
-            "(no reply in 2.5s)"
-        } catch (e: Exception) {
-            "Error: ${e.javaClass.simpleName} ${e.message}"
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun SetupLab(modifier: Modifier) {
-    val scope = rememberCoroutineScope()
-    var ip by remember { mutableStateOf("192.168.4.1") }
-    var ssid by remember { mutableStateOf("") }
-    var pwd by remember { mutableStateOf("") }
-    var msg by remember { mutableStateOf("""{"method":"getSystemConfig","params":{}}""") }
-    val log = remember { mutableStateListOf<String>() }
-    fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
-    val presets = listOf(
-        "Read config" to """{"method":"getSystemConfig","params":{}}""",
-        "Read Wi-Fi" to """{"method":"getWifiConfig","params":{}}""",
-        "Guess A" to """{"method":"setWifiConfig","params":{"ssid":"@S","psk":"@P"}}""",
-        "Guess B" to """{"method":"setSystemConfig","params":{"ssid":"@S","pwd":"@P"}}""",
-        "Guess C" to """{"method":"setWifiConfig","params":{"ssid":"@S","pwd":"@P"}}"""
-    )
-    val help = "1. Reset the bulb (5 power cycles).\n" +
-        "2. In Android Wi-Fi settings, join the WiZ_xxxxxx network. " +
-        "If asked, keep it connected even without internet.\n" +
-        "3. Come back here, fill in the hotspot name and password, " +
-        "tap a preset, then Send.\n" +
-        "4. Start with the two Read presets."
-    LazyColumn(
-        modifier,
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        item {
-            Text("Setup lab (experimental)", style = MaterialTheme.typography.titleMedium)
-            Text(help, style = MaterialTheme.typography.labelMedium)
-        }
-        item {
-            OutlinedTextField(
-                ip, { ip = it },
-                singleLine = true,
-                label = { Text("Bulb address") },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-        item {
-            OutlinedTextField(
-                ssid, { ssid = it },
-                singleLine = true,
-                label = { Text("Hotspot name") },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-        item {
-            OutlinedTextField(
-                pwd, { pwd = it },
-                singleLine = true,
-                label = { Text("Hotspot password") },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-        item {
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(presets) { (n, t) ->
-                    AssistChip(
-                        onClick = { msg = t.replace("@S", esc(ssid)).replace("@P", esc(pwd)) },
-                        label = { Text(n) }
-                    )
-                }
-            }
-        }
-        item {
-            OutlinedTextField(
-                msg, { msg = it },
-                label = { Text("Message to send") },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-        item {
-            Row {
-                Button(onClick = {
-                    scope.launch {
-                        val sent = msg
-                        val r = rawSend(ip.trim(), sent)
-                        log.add(0, "SENT: $sent\nREPLY: $r")
-                    }
-                }) { Text("Send") }
-                Spacer(Modifier.weight(1f))
-                TextButton(onClick = { log.clear() }) { Text("Clear log") }
-            }
-        }
-        items(log.toList()) { entry ->
-            androidx.compose.foundation.text.selection.SelectionContainer {
-                Text(entry, style = MaterialTheme.typography.labelSmall)
             }
         }
     }
