@@ -13,7 +13,6 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -631,7 +630,7 @@ fun FavDot(key: String, color: Color, onTap: () -> Unit, onLong: () -> Unit) {
     )
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun Controls(
     c: Ctl,
@@ -667,7 +666,11 @@ fun Controls(
 
         Text("Color", style = MaterialTheme.typography.labelMedium)
         ColorPicker(c.hue, c.sat, { h, s -> c.fade = false; c.hue = h; c.sat = s }, { sendColor() })
-        Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        FlowRow(
+            Modifier.padding(top = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             OutlinedButton(onClick = {
                 val f = "${c.hue.toInt()}|${(c.sat * 100).toInt()}|${c.dim.toInt()}"
                 if (f !in favC) {
@@ -675,20 +678,17 @@ fun Controls(
                     onSave()
                 }
             }) { Text("♥ Save") }
-            Spacer(Modifier.width(8.dp))
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(favC.toList(), key = { it }) { f ->
-                    val p = f.split("|")
-                    val h = p.getOrNull(0)?.toFloatOrNull() ?: 0f
-                    val s = (p.getOrNull(1)?.toFloatOrNull() ?: 100f) / 100f
-                    val d = p.getOrNull(2)?.toFloatOrNull() ?: 80f
-                    val dotColor = Color(android.graphics.Color.HSVToColor(floatArrayOf(h, s, 1f)))
-                    FavDot(
-                        f, dotColor,
-                        onTap = { c.fade = false; c.hue = h; c.sat = s; c.dim = d; sendColor() },
-                        onLong = { favC.remove(f); onSave() }
-                    )
-                }
+            favC.toList().forEach { f ->
+                val p = f.split("|")
+                val h = p.getOrNull(0)?.toFloatOrNull() ?: 0f
+                val s = (p.getOrNull(1)?.toFloatOrNull() ?: 100f) / 100f
+                val d = p.getOrNull(2)?.toFloatOrNull() ?: 80f
+                val dotColor = Color(android.graphics.Color.HSVToColor(floatArrayOf(h, s, 1f)))
+                FavDot(
+                    f, dotColor,
+                    onTap = { c.fade = false; c.hue = h; c.sat = s; c.dim = d; sendColor() },
+                    onLong = { favC.remove(f); onSave() }
+                )
             }
         }
 
@@ -702,7 +702,10 @@ fun Controls(
             valueRange = 2200f..6500f,
             onValueChangeFinished = { sendWhite() }
         )
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             OutlinedButton(onClick = {
                 val f = "${c.temp.toInt()}|${c.dim.toInt()}"
                 if (f !in favW) {
@@ -710,18 +713,15 @@ fun Controls(
                     onSave()
                 }
             }) { Text("♥ Save") }
-            Spacer(Modifier.width(8.dp))
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(favW.toList(), key = { it }) { f ->
-                    val p = f.split("|")
-                    val t = p.getOrNull(0)?.toFloatOrNull() ?: 3000f
-                    val d = p.getOrNull(1)?.toFloatOrNull() ?: 80f
-                    FavDot(
-                        f, whiteColor(t),
-                        onTap = { c.fade = false; c.temp = t; c.dim = d; sendWhite() },
-                        onLong = { favW.remove(f); onSave() }
-                    )
-                }
+            favW.toList().forEach { f ->
+                val p = f.split("|")
+                val t = p.getOrNull(0)?.toFloatOrNull() ?: 3000f
+                val d = p.getOrNull(1)?.toFloatOrNull() ?: 80f
+                FavDot(
+                    f, whiteColor(t),
+                    onTap = { c.fade = false; c.temp = t; c.dim = d; sendWhite() },
+                    onLong = { favW.remove(f); onSave() }
+                )
             }
         }
 
@@ -730,8 +730,11 @@ fun Controls(
             style = MaterialTheme.typography.labelMedium,
             modifier = Modifier.padding(top = 8.dp)
         )
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(scenes) { (n, id) ->
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            scenes.forEach { (n, id) ->
                 FilterChip(
                     selected = c.scene == id,
                     onClick = {
@@ -745,7 +748,8 @@ fun Controls(
         }
         Text(
             "Scene speed (${c.speed.toInt()})",
-            style = MaterialTheme.typography.labelMedium
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.padding(top = 8.dp)
         )
         Slider(
             c.speed, { c.speed = it },
@@ -888,6 +892,7 @@ fun BulbCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ThemeCard(
     t: ThemeSpec,
@@ -905,11 +910,12 @@ fun ThemeCard(
                 "${t.colors.size} colors · $mode · ${secs}s each",
                 style = MaterialTheme.typography.labelSmall
             )
-            LazyRow(
+            FlowRow(
                 Modifier.padding(vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(t.colors) {
+                t.colors.forEach {
                     Box(Modifier.size(22.dp).background(Color(it), CircleShape))
                 }
             }
@@ -924,7 +930,7 @@ fun ThemeCard(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ThemeEditor(initial: ThemeSpec?, onSave: (ThemeSpec) -> Unit, onCancel: () -> Unit) {
     var name by remember { mutableStateOf(initial?.name ?: "My theme") }
@@ -963,8 +969,11 @@ fun ThemeEditor(initial: ThemeSpec?, onSave: (ThemeSpec) -> Unit, onCancel: () -
             }
             if (colors.isNotEmpty()) {
                 Text("Tap a color to remove it", style = MaterialTheme.typography.labelSmall)
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(colors.toList()) { k ->
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    colors.toList().forEach { k ->
                         Box(
                             Modifier
                                 .size(34.dp)
@@ -975,8 +984,11 @@ fun ThemeEditor(initial: ThemeSpec?, onSave: (ThemeSpec) -> Unit, onCancel: () -
                 }
             }
             Text("Transition", style = MaterialTheme.typography.labelMedium)
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(modeNames.indices.toList()) { i ->
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                modeNames.indices.forEach { i ->
                     FilterChip(mode == i, { mode = i }, label = { Text(modeNames[i]) })
                 }
             }
