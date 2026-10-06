@@ -2,10 +2,16 @@ package com.local.wiz
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaPlayer
 import android.net.*
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -29,12 +35,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.*
 import org.json.JSONObject
 import java.net.*
+import java.nio.ByteOrder
 import kotlin.math.PI
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 object Wiz {
     @Volatile var network: Network? = null
@@ -305,6 +314,298 @@ suspend fun runTheme(t: ThemeSpec, ips: () -> List<String>) {
     }
 }
 
+class Analysis(val hopMs: Float, val loud: FloatArray, val beat: BooleanArray)
+
+fun analyzeAudio(ctx: Context, uri: Uri): Analysis? {
+    val ex = MediaExtractor()
+    var codec: MediaCodec? = null
+    try {
+        ex.setDataSource(ctx, uri, null)
+        var track = -1
+        for (i in 0 until ex.trackCount) {
+            val m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
+            if (m.startsWith("audio/")) {
+                track = i
+                break
+            }
+        }
+        if (track < 0) return null
+        ex.selectTrack(track)
+        val fmt = ex.getTrackFormat(track)
+        val mime = fmt.getString(MediaFormat.KEY_MIME) ?: return null
+        val dec = MediaCodec.createDecoderByType(mime)
+        codec = dec
+        dec.configure(fmt, null, null, 0)
+        dec.start()
+        var rate = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        var ch = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        if (ch < 1) ch = 1
+        var hop = rate / 40
+        val rms = ArrayList<Float>()
+        val bass = ArrayList<Float>()
+        var sumAll = 0f
+        var sumLow = 0f
+        var cnt = 0
+        var lp = 0f
+        val info = MediaCodec.BufferInfo()
+        var inDone = false
+        var outDone = false
+        while (!outDone) {
+            if (!inDone) {
+                val ii = dec.dequeueInputBuffer(10000)
+                if (ii >= 0) {
+                    val ib = dec.getInputBuffer(ii)
+                    val sz = if (ib != null) ex.readSampleData(ib, 0) else -1
+                    if (sz < 0) {
+                        dec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inDone = true
+                    } else {
+                        dec.queueInputBuffer(ii, 0, sz, ex.sampleTime, 0)
+                        ex.advance()
+                    }
+                }
+            }
+            val oi = dec.dequeueOutputBuffer(info, 10000)
+            if (oi >= 0) {
+                val ob = dec.getOutputBuffer(oi)
+                if (ob != null && info.size > 0) {
+                    ob.position(info.offset)
+                    ob.limit(info.offset + info.size)
+                    val sb = ob.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                    val frames = sb.remaining() / ch
+                    for (f in 0 until frames) {
+                        var m = 0f
+                        for (c in 0 until ch) {
+                            m += sb.get().toFloat()
+                        }
+                        m = m / ch / 32768f
+                        lp += 0.05f * (m - lp)
+                        sumAll += m * m
+                        sumLow += lp * lp
+                        cnt++
+                        if (cnt >= hop) {
+                            rms.add(sqrt(sumAll / cnt))
+                            bass.add(sqrt(sumLow / cnt))
+                            sumAll = 0f
+                            sumLow = 0f
+                            cnt = 0
+                        }
+                    }
+                }
+                dec.releaseOutputBuffer(oi, false)
+                if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                    outDone = true
+                }
+            } else if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                val of = dec.outputFormat
+                rate = of.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                ch = of.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                if (ch < 1) ch = 1
+                hop = rate / 40
+            }
+        }
+        val n = rms.size
+        if (n < 10) return null
+        var maxRms = 0.0001f
+        for (v in rms) {
+            if (v > maxRms) maxRms = v
+        }
+        val loud = FloatArray(n) { sqrt((rms[it] / maxRms).coerceIn(0f, 1f)) }
+        val beat = BooleanArray(n)
+        val win = 40
+        var run = 0f
+        var lastBeat = -100
+        for (i in 0 until n) {
+            run += bass[i]
+            if (i >= win) run -= bass[i - win]
+            val mean = run / minOf(i + 1, win)
+            val prev = if (i > 0) bass[i - 1] else 0f
+            if (bass[i] > 1.3f * mean + 0.004f && bass[i] > prev && i - lastBeat >= 8) {
+                beat[i] = true
+                lastBeat = i
+            }
+        }
+        val hopMs = 1000f * hop / rate
+        return Analysis(hopMs, loud, beat)
+    } catch (e: Exception) {
+        return null
+    } finally {
+        try {
+            codec?.stop()
+        } catch (e: Exception) {
+        }
+        try {
+            codec?.release()
+        } catch (e: Exception) {
+        }
+        ex.release()
+    }
+}
+
+fun paletteColor(themes: List<ThemeSpec>, palIdx: Int, step: Int): Int {
+    val t = themes.getOrNull(palIdx)
+    if (t == null || t.colors.isEmpty()) {
+        val h = ((step * 47) % 360).toFloat()
+        return android.graphics.Color.HSVToColor(floatArrayOf(h, 1f, 1f))
+    }
+    return t.colors[step % t.colors.size]
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var uri by remember { mutableStateOf<Uri?>(null) }
+    var fileName by remember { mutableStateOf("") }
+    var analysis by remember { mutableStateOf<Analysis?>(null) }
+    var analyzing by remember { mutableStateOf(false) }
+    var playing by remember { mutableStateOf(false) }
+    var lead by remember { mutableStateOf(150f) }
+    var mode by remember { mutableStateOf(0) }
+    var palIdx by remember { mutableStateOf(-1) }
+    var msg by remember { mutableStateOf("") }
+    val ipsNow = rememberUpdatedState(ips)
+
+    val picker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { u: Uri? ->
+        if (u != null) {
+            playing = false
+            uri = u
+            fileName = u.lastPathSegment ?: "song"
+            analysis = null
+            analyzing = true
+            msg = ""
+            scope.launch {
+                val r = withContext(Dispatchers.Default) { analyzeAudio(ctx, u) }
+                analysis = r
+                analyzing = false
+                msg = if (r == null) "Could not read this audio file." else ""
+            }
+        }
+    }
+
+    LaunchedEffect(playing) {
+        val a = analysis
+        val u = uri
+        if (playing && a != null && u != null) {
+            val mp = MediaPlayer()
+            try {
+                withContext(Dispatchers.IO) {
+                    mp.setDataSource(ctx, u)
+                    mp.prepare()
+                }
+                mp.start()
+                var lastIdx = -1
+                var step = 0
+                var lastBeatPos = -10000f
+                while (isActive && playing && mp.isPlaying) {
+                    val pos = mp.currentPosition + lead
+                    val idx = (pos / a.hopMs).toInt().coerceIn(0, a.loud.size - 1)
+                    var k = lastIdx + 1
+                    while (k <= idx) {
+                        if (a.beat[k]) {
+                            step++
+                            lastBeatPos = k * a.hopMs
+                        }
+                        k++
+                    }
+                    lastIdx = idx
+                    val bright = if (mode == 0) {
+                        (100 - (pos - lastBeatPos) / 6f).toInt().coerceIn(20, 100)
+                    } else {
+                        (10 + 90 * a.loud[idx]).toInt().coerceIn(10, 100)
+                    }
+                    val color = paletteColor(themes, palIdx, step)
+                    ipsNow.value.forEach { ip -> setRgb(ip, color, bright, 1) }
+                    delay(90)
+                }
+            } catch (e: Exception) {
+                msg = "Playback problem: ${e.message}"
+            } finally {
+                try {
+                    mp.release()
+                } catch (e: Exception) {
+                }
+                playing = false
+            }
+        }
+    }
+
+    LazyColumn(
+        modifier,
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        item {
+            Text("Music sync (song file)", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Stop any running theme first. Keep the screen on while it plays.",
+                style = MaterialTheme.typography.labelMedium
+            )
+        }
+        item {
+            Button(onClick = { picker.launch(arrayOf("audio/*")) }, enabled = !analyzing) {
+                Text("Choose song")
+            }
+            if (fileName.isNotBlank()) {
+                Text(fileName, style = MaterialTheme.typography.labelMedium)
+            }
+            if (analyzing) {
+                Text("Analyzing the song, please wait...", color = MaterialTheme.colorScheme.primary)
+            }
+            if (msg.isNotBlank()) {
+                Text(msg, style = MaterialTheme.typography.labelMedium)
+            }
+        }
+        item {
+            Text("Style", style = MaterialTheme.typography.labelMedium)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(mode == 0, { mode = 0 }, label = { Text("Beats") })
+                FilterChip(mode == 1, { mode = 1 }, label = { Text("Loudness") })
+            }
+        }
+        item {
+            Text("Colors", style = MaterialTheme.typography.labelMedium)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(palIdx == -1, { palIdx = -1 }, label = { Text("Rainbow") })
+                themes.forEachIndexed { i, t ->
+                    FilterChip(palIdx == i, { palIdx = i }, label = { Text(t.name) })
+                }
+            }
+        }
+        item {
+            Text(
+                "Sync offset: ${lead.toInt()} ms",
+                style = MaterialTheme.typography.labelMedium
+            )
+            Slider(lead, { lead = it }, valueRange = -400f..800f)
+            Text(
+                "Raise it if the lights come after the sound. Lower it if they come before, for example with Bluetooth speakers.",
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+        item {
+            Button(
+                onClick = { playing = !playing },
+                enabled = analysis != null && !analyzing && ips.isNotEmpty()
+            ) {
+                Text(if (playing) "Stop" else "Play with lights")
+            }
+            if (ips.isEmpty()) {
+                Text("No online bulbs found yet.", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -429,7 +730,7 @@ fun App(prefs: SharedPreferences) {
                 }
             }
             TabRow(selectedTabIndex = tab) {
-                listOf("Bulbs", "Sync", "Themes").forEachIndexed { i, t ->
+                listOf("Bulbs", "Sync", "Themes", "Music").forEachIndexed { i, t ->
                     Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t) })
                 }
             }
@@ -495,6 +796,11 @@ fun App(prefs: SharedPreferences) {
                         SyncPanel(ips, favC, favW) { saveAll() }
                     }
                 }
+                3 -> MusicTab(
+                    lm,
+                    bulbs.filter { online[it.first] != false }.map { it.second },
+                    themes
+                )
                 else -> LazyColumn(
                     lm,
                     contentPadding = PaddingValues(16.dp),
