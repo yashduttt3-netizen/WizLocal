@@ -1,11 +1,16 @@
 package com.local.wiz
 
+import android.Manifest
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaPlayer
+import android.media.MediaRecorder
 import android.net.*
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -442,13 +447,131 @@ fun analyzeAudio(ctx: Context, uri: Uri): Analysis? {
     }
 }
 
-fun paletteColor(themes: List<ThemeSpec>, palIdx: Int, step: Int): Int {
-    val t = themes.getOrNull(palIdx)
-    if (t == null || t.colors.isEmpty()) {
-        val h = ((step * 47) % 360).toFloat()
+val builtinPals: List<Pair<String, List<Int>>> = listOf(
+    "Rainbow" to emptyList<Int>(),
+    "Neon" to listOf(
+        0xFFFF00FF.toInt(), 0xFF00FFFF.toInt(), 0xFF7CFF00.toInt(), 0xFFFFEE00.toInt()
+    ),
+    "Fire" to listOf(
+        0xFFFF2200.toInt(), 0xFFFF6A00.toInt(), 0xFFFFB300.toInt(), 0xFFFFE066.toInt()
+    ),
+    "Ocean" to listOf(
+        0xFF0033FF.toInt(), 0xFF00A6FF.toInt(), 0xFF00E5C8.toInt(), 0xFFB3F0FF.toInt()
+    ),
+    "Sunset" to listOf(
+        0xFF7A00FF.toInt(), 0xFFFF0080.toInt(), 0xFFFF5A00.toInt(), 0xFFFFC400.toInt()
+    ),
+    "Ice" to listOf(
+        0xFFFFFFFF.toInt(), 0xFFB3E5FF.toInt(), 0xFF4DA6FF.toInt()
+    ),
+    "Club" to listOf(
+        0xFFFF0000.toInt(), 0xFF0000FF.toInt(), 0xFF00FF00.toInt(), 0xFFAA00FF.toInt()
+    ),
+    "Candy" to listOf(
+        0xFFFF4DA6.toInt(), 0xFF4DFFEA.toInt(), 0xFFFFF04D.toInt(), 0xFFB48CFF.toInt()
+    )
+)
+
+val styleNames = listOf(
+    "Beats", "Loudness", "Disco blink", "Club alternate", "Random flash", "Flow"
+)
+val styleHelp = listOf(
+    "The color changes on each beat, then fades down",
+    "Brightness follows the volume",
+    "Full flash on every beat, dark in between (disco)",
+    "Bulbs take turns lighting up on each beat",
+    "Random bulbs flash random colors on each beat",
+    "Colors slowly flow, brightness follows the volume"
+)
+
+fun palColor(p: List<Int>, i: Int): Int {
+    if (p.isEmpty()) {
+        val h = ((i * 47) % 360).toFloat()
         return android.graphics.Color.HSVToColor(floatArrayOf(h, 1f, 1f))
     }
-    return t.colors[step % t.colors.size]
+    return p[((i % p.size) + p.size) % p.size]
+}
+
+class FxState {
+    var step = 0
+    var lastBeat = -100000L
+    var off = false
+}
+
+suspend fun renderFx(
+    style: Int,
+    ips: List<String>,
+    pal: List<Int>,
+    st: FxState,
+    beat: Boolean,
+    now: Long,
+    level: Float
+) {
+    if (ips.isEmpty()) return
+    if (beat) {
+        st.step++
+        st.lastBeat = now
+    }
+    val since = (now - st.lastBeat).coerceAtLeast(0L)
+    when (style) {
+        0 -> {
+            val b = (100 - since / 6).toInt().coerceIn(20, 100)
+            val c = palColor(pal, st.step)
+            ips.forEach { setRgb(it, c, b, 1) }
+        }
+        1 -> {
+            val b = (10 + 90 * level).toInt().coerceIn(10, 100)
+            val c = palColor(pal, st.step)
+            ips.forEach { setRgb(it, c, b, 1) }
+        }
+        2 -> {
+            if (beat) {
+                val c = palColor(pal, st.step)
+                ips.forEach { setRgb(it, c, 100, 1) }
+                st.off = false
+            } else if (since > 100 && !st.off) {
+                ips.forEach { Wiz.send(it, pilot("\"state\":false"), 1) }
+                st.off = true
+            }
+        }
+        3 -> {
+            if (beat) {
+                val c1 = palColor(pal, st.step / 4)
+                val c2 = palColor(pal, st.step / 4 + 1)
+                ips.forEachIndexed { i, ip ->
+                    if (i == st.step % ips.size) {
+                        setRgb(ip, c1, 100, 1)
+                    } else {
+                        setRgb(ip, c2, 12, 1)
+                    }
+                }
+            }
+        }
+        4 -> {
+            if (beat) {
+                ips.forEach { ip ->
+                    if ((0..99).random() < 65) {
+                        setRgb(ip, palColor(pal, (0..50).random()), 100, 1)
+                    } else {
+                        setRgb(ip, palColor(pal, st.step), 10, 1)
+                    }
+                }
+            }
+        }
+        else -> {
+            val c: Int
+            if (pal.isEmpty()) {
+                val h = ((now / 15) % 360).toFloat()
+                c = android.graphics.Color.HSVToColor(floatArrayOf(h, 1f, 1f))
+            } else {
+                val pos = now / 1500f
+                val i = pos.toInt()
+                c = mix(palColor(pal, i), palColor(pal, i + 1), pos - i)
+            }
+            val b = (15 + 85 * level).toInt().coerceIn(10, 100)
+            ips.forEach { setRgb(it, c, b, 1) }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -461,11 +584,15 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
     var analysis by remember { mutableStateOf<Analysis?>(null) }
     var analyzing by remember { mutableStateOf(false) }
     var playing by remember { mutableStateOf(false) }
+    var mic by remember { mutableStateOf(false) }
     var lead by remember { mutableStateOf(150f) }
-    var mode by remember { mutableStateOf(0) }
-    var palIdx by remember { mutableStateOf(-1) }
+    var style by remember { mutableStateOf(0) }
+    var palIdx by remember { mutableStateOf(0) }
+    var sens by remember { mutableStateOf(0.5f) }
     var msg by remember { mutableStateOf("") }
     val ipsNow = rememberUpdatedState(ips)
+    val pals = builtinPals + themes.map { it.name to it.colors }
+    val palNow = rememberUpdatedState(pals.getOrNull(palIdx)?.second ?: emptyList())
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -486,6 +613,17 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
         }
     }
 
+    val permLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { ok ->
+        if (ok) {
+            playing = false
+            mic = true
+        } else {
+            msg = "Microphone permission was denied."
+        }
+    }
+
     LaunchedEffect(playing) {
         val a = analysis
         val u = uri
@@ -497,28 +635,19 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
                     mp.prepare()
                 }
                 mp.start()
+                val st = FxState()
                 var lastIdx = -1
-                var step = 0
-                var lastBeatPos = -10000f
                 while (isActive && playing && mp.isPlaying) {
                     val pos = mp.currentPosition + lead
                     val idx = (pos / a.hopMs).toInt().coerceIn(0, a.loud.size - 1)
+                    var beat = false
                     var k = lastIdx + 1
                     while (k <= idx) {
-                        if (a.beat[k]) {
-                            step++
-                            lastBeatPos = k * a.hopMs
-                        }
+                        if (a.beat[k]) beat = true
                         k++
                     }
                     lastIdx = idx
-                    val bright = if (mode == 0) {
-                        (100 - (pos - lastBeatPos) / 6f).toInt().coerceIn(20, 100)
-                    } else {
-                        (10 + 90 * a.loud[idx]).toInt().coerceIn(10, 100)
-                    }
-                    val color = paletteColor(themes, palIdx, step)
-                    ipsNow.value.forEach { ip -> setRgb(ip, color, bright, 1) }
+                    renderFx(style, ipsNow.value, palNow.value, st, beat, pos.toLong(), a.loud[idx])
                     delay(90)
                 }
             } catch (e: Exception) {
@@ -529,6 +658,82 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
                 } catch (e: Exception) {
                 }
                 playing = false
+                withContext(NonCancellable) {
+                    ipsNow.value.forEach { Wiz.send(it, pilot("\"state\":true"), 1) }
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(mic) {
+        if (mic) {
+            val rate = 16000
+            val minBuf = AudioRecord.getMinBufferSize(
+                rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            var recRef: AudioRecord? = null
+            try {
+                val r = AudioRecord(
+                    MediaRecorder.AudioSource.MIC, rate,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                    maxOf(minBuf, rate / 2)
+                )
+                recRef = r
+                r.startRecording()
+                val buf = ShortArray(rate / 20)
+                val st = FxState()
+                val t0 = System.currentTimeMillis()
+                var peak = 0.02f
+                var lp = 0f
+                var meanBass = 0f
+                var prevBass = 0f
+                var lastBeatT = 0L
+                var lastRender = 0L
+                var pendBeat = false
+                var lvl = 0f
+                while (isActive && mic) {
+                    val n = withContext(Dispatchers.IO) { r.read(buf, 0, buf.size) }
+                    if (n <= 0) continue
+                    var sa = 0f
+                    var sl = 0f
+                    for (i in 0 until n) {
+                        val x = buf[i] / 32768f
+                        lp += 0.06f * (x - lp)
+                        sa += x * x
+                        sl += lp * lp
+                    }
+                    val rms = sqrt(sa / n)
+                    val bass = sqrt(sl / n)
+                    peak = maxOf(rms, peak * 0.998f, 0.01f)
+                    lvl = sqrt((rms / peak).coerceIn(0f, 1f))
+                    val now = System.currentTimeMillis() - t0
+                    val factor = 2.0f - sens
+                    if (bass > factor * meanBass + 0.003f && bass > prevBass && now - lastBeatT > 250) {
+                        pendBeat = true
+                        lastBeatT = now
+                    }
+                    meanBass = meanBass * 0.97f + bass * 0.03f
+                    prevBass = bass
+                    if (now - lastRender >= 90) {
+                        renderFx(style, ipsNow.value, palNow.value, st, pendBeat, now, lvl)
+                        pendBeat = false
+                        lastRender = now
+                    }
+                }
+            } catch (e: Exception) {
+                msg = "Microphone problem: ${e.message}"
+            } finally {
+                recRef?.let {
+                    try {
+                        it.stop()
+                    } catch (e: Exception) {
+                    }
+                    it.release()
+                }
+                mic = false
+                withContext(NonCancellable) {
+                    ipsNow.value.forEach { Wiz.send(it, pilot("\"state\":true"), 1) }
+                }
             }
         }
     }
@@ -539,13 +744,73 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         item {
-            Text("Music sync (song file)", style = MaterialTheme.typography.titleMedium)
+            Text("Music sync", style = MaterialTheme.typography.titleMedium)
             Text(
-                "Stop any running theme first. Keep the screen on while it plays.",
+                "Stop any running theme first. Keep the app open and the screen on.",
                 style = MaterialTheme.typography.labelMedium
+            )
+            Text(
+                "Disco blink and Club alternate flash fast, which can affect people sensitive to flashing lights.",
+                style = MaterialTheme.typography.labelSmall
             )
         }
         item {
+            Text("Style", style = MaterialTheme.typography.labelMedium)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                styleNames.indices.forEach { i ->
+                    FilterChip(style == i, { style = i }, label = { Text(styleNames[i]) })
+                }
+            }
+            Text(
+                styleHelp[style.coerceIn(0, styleHelp.size - 1)],
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+        item {
+            Text("Colors", style = MaterialTheme.typography.labelMedium)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                pals.forEachIndexed { i, p ->
+                    FilterChip(palIdx == i, { palIdx = i }, label = { Text(p.first) })
+                }
+            }
+        }
+        item {
+            Text("Microphone (live, any music)", style = MaterialTheme.typography.titleSmall)
+            Text(
+                "Listens to the room. Turn the music up so the phone can hear it.",
+                style = MaterialTheme.typography.labelSmall
+            )
+            Button(
+                onClick = {
+                    if (mic) {
+                        mic = false
+                    } else if (ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                        == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        playing = false
+                        mic = true
+                    } else {
+                        permLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                },
+                enabled = ips.isNotEmpty()
+            ) {
+                Text(if (mic) "Stop microphone sync" else "Start microphone sync")
+            }
+            Text(
+                "Mic sensitivity: ${(sens * 100).toInt()}%",
+                style = MaterialTheme.typography.labelMedium
+            )
+            Slider(sens, { sens = it }, valueRange = 0f..1f)
+        }
+        item {
+            Text("Song file (pre-analyzed, tighter timing)", style = MaterialTheme.typography.titleSmall)
             Button(onClick = { picker.launch(arrayOf("audio/*")) }, enabled = !analyzing) {
                 Text("Choose song")
             }
@@ -555,33 +820,6 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
             if (analyzing) {
                 Text("Analyzing the song, please wait...", color = MaterialTheme.colorScheme.primary)
             }
-            if (msg.isNotBlank()) {
-                Text(msg, style = MaterialTheme.typography.labelMedium)
-            }
-        }
-        item {
-            Text("Style", style = MaterialTheme.typography.labelMedium)
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                FilterChip(mode == 0, { mode = 0 }, label = { Text("Beats") })
-                FilterChip(mode == 1, { mode = 1 }, label = { Text("Loudness") })
-            }
-        }
-        item {
-            Text("Colors", style = MaterialTheme.typography.labelMedium)
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                FilterChip(palIdx == -1, { palIdx = -1 }, label = { Text("Rainbow") })
-                themes.forEachIndexed { i, t ->
-                    FilterChip(palIdx == i, { palIdx = i }, label = { Text(t.name) })
-                }
-            }
-        }
-        item {
             Text(
                 "Sync offset: ${lead.toInt()} ms",
                 style = MaterialTheme.typography.labelMedium
@@ -591,13 +829,23 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
                 "Raise it if the lights come after the sound. Lower it if they come before, for example with Bluetooth speakers.",
                 style = MaterialTheme.typography.labelSmall
             )
-        }
-        item {
             Button(
-                onClick = { playing = !playing },
+                onClick = {
+                    if (playing) {
+                        playing = false
+                    } else {
+                        mic = false
+                        playing = true
+                    }
+                },
                 enabled = analysis != null && !analyzing && ips.isNotEmpty()
             ) {
                 Text(if (playing) "Stop" else "Play with lights")
+            }
+        }
+        item {
+            if (msg.isNotBlank()) {
+                Text(msg, style = MaterialTheme.typography.labelMedium)
             }
             if (ips.isEmpty()) {
                 Text("No online bulbs found yet.", style = MaterialTheme.typography.labelSmall)
