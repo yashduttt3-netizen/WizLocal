@@ -1061,6 +1061,8 @@ fun App(prefs: SharedPreferences) {
         l
     }
     val online = remember { mutableStateMapOf<String, Boolean>() }
+    val ctls = remember { HashMap<String, Ctl>() }
+    val syncCtl = remember { Ctl() }
     val scope = rememberCoroutineScope()
     var scanning by remember { mutableStateOf(false) }
     var manual by remember { mutableStateOf("") }
@@ -1106,6 +1108,27 @@ fun App(prefs: SharedPreferences) {
     LaunchedEffect(Unit) {
         delay(800)
         scan()
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(200)
+            for (b in bulbs.toList()) {
+                val c = ctls[b.first] ?: continue
+                if (c.fade) {
+                    c.hue = (c.hue + c.fadeSpeed) % 360f
+                    val k = android.graphics.Color.HSVToColor(floatArrayOf(c.hue, c.sat, 1f))
+                    Wiz.send(b.second, pilot(rgbParams(k, c.dim.toInt())), 1)
+                }
+            }
+            if (syncCtl.fade) {
+                syncCtl.hue = (syncCtl.hue + syncCtl.fadeSpeed) % 360f
+                val k = android.graphics.Color.HSVToColor(floatArrayOf(syncCtl.hue, syncCtl.sat, 1f))
+                val msg = pilot(rgbParams(k, syncCtl.dim.toInt()))
+                bulbs.toList().filter { online[it.first] != false }.forEach {
+                    Wiz.send(it.second, msg, 1)
+                }
+            }
+        }
     }
     LaunchedEffect(running) {
         val t = running
@@ -1198,12 +1221,17 @@ fun App(prefs: SharedPreferences) {
                         }
                     }
                     items(bulbs.toList(), key = { it.first }) { (mac, ip) ->
+                        val bc = ctls.getOrPut(mac) { Ctl() }
                         BulbCard(
-                            mac, ip, names[mac] ?: "", online[mac], favC, favW,
+                            mac, ip, bc, names[mac] ?: "", online[mac], favC, favW,
                             onSave = { saveAll() },
                             onRename = { n -> names[mac] = n; saveAll() },
                             onStatus = { ok -> online[mac] = ok },
-                            onRemove = { bulbs.removeAll { it.first == mac }; saveAll() },
+                            onRemove = {
+                                bc.fade = false
+                                bulbs.removeAll { it.first == mac }
+                                saveAll()
+                            },
                             tick = refreshTick
                         )
                     }
@@ -1211,7 +1239,7 @@ fun App(prefs: SharedPreferences) {
                 1 -> LazyColumn(lm, contentPadding = PaddingValues(16.dp)) {
                     item {
                         val ips = bulbs.filter { online[it.first] != false }.map { it.second }
-                        SyncPanel(ips, favC, favW) { saveAll() }
+                        SyncPanel(syncCtl, ips, favC, favW) { saveAll() }
                     }
                 }
                 2 -> LazyColumn(
@@ -1291,6 +1319,7 @@ class Ctl {
     var sat by mutableStateOf(1f)
     var temp by mutableStateOf(3000f)
     var fade by mutableStateOf(false)
+    var fadeSpeed by mutableStateOf(4f)
     var scene by mutableStateOf(0)
     var speed by mutableStateOf(100f)
 }
@@ -1345,6 +1374,42 @@ fun ColorPicker(hue: Float, sat: Float, onMove: (Float, Float) -> Unit, onDone: 
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun HexField(hue: Float, sat: Float, onApply: (Float, Float) -> Unit) {
+    val apply = rememberUpdatedState(onApply)
+    val cur = android.graphics.Color.HSVToColor(floatArrayOf(hue, sat, 1f))
+    val curHex = String.format("%06X", cur and 0xFFFFFF)
+    var text by remember { mutableStateOf(curHex) }
+    var bad by remember { mutableStateOf(false) }
+    LaunchedEffect(curHex) {
+        text = curHex
+        bad = false
+    }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { v ->
+            text = v
+            val h = v.trim().removePrefix("#").uppercase()
+            val valid = h.length == 6 && h.all { it in "0123456789ABCDEF" }
+            if (valid) {
+                bad = false
+                val col = android.graphics.Color.parseColor("#$h")
+                val hsv = FloatArray(3)
+                android.graphics.Color.colorToHSV(col, hsv)
+                apply.value(hsv[0].coerceIn(0f, 359f), hsv[1])
+            } else {
+                bad = h.length >= 6
+            }
+        },
+        singleLine = true,
+        isError = bad,
+        label = { Text("Hex color (e.g. FF6A00)") },
+        prefix = { Text("#") },
+        modifier = Modifier.fillMaxWidth()
+    )
+}
+
 @Composable
 fun FavDot(key: String, color: Color, onTap: () -> Unit, onLong: () -> Unit) {
     val tap = rememberUpdatedState(onTap)
@@ -1377,13 +1442,6 @@ fun Controls(
         c.scene = 0
         send("\"state\":true,\"temp\":${c.temp.toInt()},\"dimming\":${c.dim.toInt()}")
     }
-    LaunchedEffect(c.fade) {
-        while (c.fade) {
-            c.hue = (c.hue + 4) % 360
-            sendColor()
-            delay(200)
-        }
-    }
 
     Column {
         Text("Brightness", style = MaterialTheme.typography.labelMedium)
@@ -1395,6 +1453,13 @@ fun Controls(
 
         Text("Color", style = MaterialTheme.typography.labelMedium)
         ColorPicker(c.hue, c.sat, { h, s -> c.fade = false; c.hue = h; c.sat = s }, { sendColor() })
+        Spacer(Modifier.height(6.dp))
+        HexField(c.hue, c.sat) { h, s ->
+            c.fade = false
+            c.hue = h
+            c.sat = s
+            sendColor()
+        }
         FlowRow(
             Modifier.padding(top = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1486,22 +1551,34 @@ fun Controls(
             onValueChangeFinished = { if (c.scene != 0) send(sceneParams(c)) }
         )
         FilterChip(
-            c.fade, { c.fade = !c.fade },
+            c.fade,
+            {
+                c.fade = !c.fade
+                if (c.fade) {
+                    c.scene = 0
+                    if (c.sat < 0.5f) c.sat = 1f
+                }
+            },
             label = { Text("Rainbow fade") },
             modifier = Modifier.padding(top = 4.dp)
         )
+        Text(
+            "Rainbow fade speed (${c.fadeSpeed.toInt()})",
+            style = MaterialTheme.typography.labelMedium
+        )
+        Slider(c.fadeSpeed, { c.fadeSpeed = it }, valueRange = 1f..20f)
     }
 }
 
 @Composable
 fun SyncPanel(
+    c: Ctl,
     ips: List<String>,
     favC: SnapshotStateList<String>,
     favW: SnapshotStateList<String>,
     onSave: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
-    val c = remember { Ctl() }
     val send: (String) -> Unit = { p ->
         scope.launch { ips.forEach { Wiz.send(it, pilot(p)) } }
     }
@@ -1527,6 +1604,7 @@ fun SyncPanel(
 fun BulbCard(
     mac: String,
     ip: String,
+    c: Ctl,
     name: String,
     online: Boolean?,
     favC: SnapshotStateList<String>,
@@ -1538,7 +1616,6 @@ fun BulbCard(
     tick: Int = 0
 ) {
     val scope = rememberCoroutineScope()
-    val c = remember { Ctl() }
     var editing by remember { mutableStateOf(false) }
     var draft by remember { mutableStateOf(name) }
 
@@ -1556,12 +1633,14 @@ fun BulbCard(
             if (it.has("speed")) {
                 c.speed = it.optInt("speed", 100).toFloat().coerceIn(10f, 200f)
             }
-            c.scene = it.optInt("sceneId", 0)
-            if (it.has("r")) {
-                val hsv = FloatArray(3)
-                android.graphics.Color.RGBToHSV(it.optInt("r"), it.optInt("g"), it.optInt("b"), hsv)
-                c.hue = hsv[0]
-                c.sat = hsv[1]
+            if (!c.fade) {
+                c.scene = it.optInt("sceneId", 0)
+                if (it.has("r")) {
+                    val hsv = FloatArray(3)
+                    android.graphics.Color.RGBToHSV(it.optInt("r"), it.optInt("g"), it.optInt("b"), hsv)
+                    c.hue = hsv[0]
+                    c.sat = hsv[1]
+                }
             }
         }
     }
@@ -1686,10 +1765,11 @@ fun ThemeEditor(initial: ThemeSpec?, onSave: (ThemeSpec) -> Unit, onCancel: () -
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                "Pick a color, then tap Add (${colors.size}/12)",
+                "Pick a color or type a hex code, then tap Add (${colors.size}/12)",
                 style = MaterialTheme.typography.labelMedium
             )
             ColorPicker(hue, sat, { h, s -> hue = h; sat = s }, {})
+            HexField(hue, sat) { h, s -> hue = h; sat = s }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(28.dp).background(Color(current), CircleShape))
                 Spacer(Modifier.width(10.dp))
