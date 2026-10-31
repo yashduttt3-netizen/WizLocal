@@ -1,9 +1,16 @@
 package com.local.wiz
 
 import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaCodec
@@ -12,7 +19,11 @@ import android.media.MediaFormat
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.*
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
+import android.os.PowerManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -49,6 +60,90 @@ import java.nio.ByteOrder
 import kotlin.math.PI
 import kotlin.math.sin
 import kotlin.math.sqrt
+
+object Bus {
+    var stopTick by mutableStateOf(0)
+}
+
+class KeepAliveService : Service() {
+    private var wake: PowerManager.WakeLock? = null
+    private var wifi: WifiManager.WifiLock? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "STOP") {
+            Bus.stopTick++
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val withMic = intent?.getBooleanExtra("mic", false) ?: false
+        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26) {
+            mgr.createNotificationChannel(
+                NotificationChannel("wiz", "WiZ Local", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val stopIntent = Intent(this, KeepAliveService::class.java).setAction("STOP")
+        val stopPi = PendingIntent.getService(
+            this, 1, stopIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val openPi = PendingIntent.getActivity(
+            this, 2, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        )
+        val notif = Notification.Builder(this, "wiz")
+            .setContentTitle("WiZ Local is running")
+            .setContentText("Controlling your lights")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentIntent(openPi)
+            .addAction(Notification.Action.Builder(0, "Stop", stopPi).build())
+            .setOngoing(true)
+            .build()
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                if (withMic) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                startForeground(1, notif, type)
+            } else {
+                startForeground(1, notif)
+            }
+        } catch (e: Exception) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        try {
+            if (wake == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                val w = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wiz:keep")
+                w.setReferenceCounted(false)
+                w.acquire(4 * 60 * 60 * 1000L)
+                wake = w
+            }
+            if (wifi == null) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                val l = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "wiz:wifi")
+                l.setReferenceCounted(false)
+                l.acquire()
+                wifi = l
+            }
+        } catch (e: Exception) {
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        try {
+            wake?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {
+        }
+        try {
+            wifi?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {
+        }
+        super.onDestroy()
+    }
+}
 
 object Wiz {
     @Volatile var network: Network? = null
@@ -576,7 +671,12 @@ suspend fun renderFx(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
+fun MusicTab(
+    modifier: Modifier,
+    ips: List<String>,
+    themes: List<ThemeSpec>,
+    onActive: (Boolean, Boolean) -> Unit
+) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var uri by remember { mutableStateOf<Uri?>(null) }
@@ -593,6 +693,16 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
     val ipsNow = rememberUpdatedState(ips)
     val pals = builtinPals + themes.map { it.name to it.colors }
     val palNow = rememberUpdatedState(pals.getOrNull(palIdx)?.second ?: emptyList())
+
+    LaunchedEffect(playing, mic) {
+        onActive(playing || mic, mic)
+    }
+    LaunchedEffect(Bus.stopTick) {
+        if (Bus.stopTick > 0) {
+            playing = false
+            mic = false
+        }
+    }
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -673,6 +783,7 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
             )
             var recRef: AudioRecord? = null
             try {
+                delay(400)
                 val r = AudioRecord(
                     MediaRecorder.AudioSource.MIC, rate,
                     AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
@@ -746,7 +857,7 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
         item {
             Text("Music sync", style = MaterialTheme.typography.titleMedium)
             Text(
-                "Stop any running theme first. Keep the app open and the screen on.",
+                "Stop any running theme first. It keeps running in the background with a notification.",
                 style = MaterialTheme.typography.labelMedium
             )
             Text(
@@ -855,6 +966,8 @@ fun MusicTab(modifier: Modifier, ips: List<String>, themes: List<ThemeSpec>) {
 }
 
 class MainActivity : ComponentActivity() {
+    private var netCb: ConnectivityManager.NetworkCallback? = null
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         try {
@@ -862,13 +975,25 @@ class MainActivity : ComponentActivity() {
             val req = NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                 .build()
-            cm.requestNetwork(req, object : ConnectivityManager.NetworkCallback() {
+            val cb = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(n: Network) {
                     Wiz.network = n
                     cm.bindProcessToNetwork(n)
                 }
-            })
+
+                override fun onLost(n: Network) {
+                    if (Wiz.network == n) Wiz.network = null
+                }
+            }
+            netCb = cb
+            cm.requestNetwork(req, cb)
         } catch (e: Exception) {
+        }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7)
         }
         val prefs = getSharedPreferences("bulbs", MODE_PRIVATE)
         setContent {
@@ -884,10 +1009,24 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onDestroy() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            netCb?.let { cm.unregisterNetworkCallback(it) }
+        } catch (e: Exception) {
+        }
+        try {
+            stopService(Intent(this, KeepAliveService::class.java))
+        } catch (e: Exception) {
+        }
+        super.onDestroy()
+    }
 }
 
 @Composable
 fun App(prefs: SharedPreferences) {
+    val ctx = LocalContext.current
     val bulbs = remember {
         val list = mutableStateListOf<Pair<String, String>>()
         prefs.getStringSet("bulbs2", emptySet())!!.forEach {
@@ -929,6 +1068,9 @@ fun App(prefs: SharedPreferences) {
     var running by remember { mutableStateOf<ThemeSpec?>(null) }
     var editing by remember { mutableStateOf(false) }
     var editIndex by remember { mutableStateOf(-1) }
+    var refreshTick by remember { mutableStateOf(0) }
+    var musicActive by remember { mutableStateOf(false) }
+    var micOn by remember { mutableStateOf(false) }
 
     fun saveAll() {
         prefs.edit()
@@ -947,7 +1089,18 @@ fun App(prefs: SharedPreferences) {
     }
     suspend fun scan() {
         scanning = true
-        Wiz.discover().forEach { add(it.first, it.second) }
+        val found = Wiz.discover()
+        found.forEach {
+            add(it.first, it.second)
+            online[it.first] = true
+        }
+        val rest = bulbs.toList().filter { b -> found.none { it.first == b.first } }
+        coroutineScope {
+            rest.map { b -> async { b.first to (Wiz.query(b.second) != null) } }
+                .awaitAll()
+                .forEach { (m, ok) -> online[m] = ok }
+        }
+        refreshTick++
         scanning = false
     }
     LaunchedEffect(Unit) {
@@ -958,6 +1111,22 @@ fun App(prefs: SharedPreferences) {
         val t = running
         if (t != null) {
             runTheme(t) { bulbs.filter { online[it.first] != false }.map { it.second } }
+        }
+    }
+    LaunchedEffect(Bus.stopTick) {
+        if (Bus.stopTick > 0) running = null
+    }
+    val active = running != null || musicActive
+    LaunchedEffect(active, micOn) {
+        try {
+            val i = Intent(ctx, KeepAliveService::class.java)
+            if (active) {
+                i.putExtra("mic", micOn)
+                ctx.startForegroundService(i)
+            } else {
+                ctx.stopService(i)
+            }
+        } catch (e: Exception) {
         }
     }
 
@@ -1034,7 +1203,8 @@ fun App(prefs: SharedPreferences) {
                             onSave = { saveAll() },
                             onRename = { n -> names[mac] = n; saveAll() },
                             onStatus = { ok -> online[mac] = ok },
-                            onRemove = { bulbs.removeAll { it.first == mac }; saveAll() }
+                            onRemove = { bulbs.removeAll { it.first == mac }; saveAll() },
+                            tick = refreshTick
                         )
                     }
                 }
@@ -1044,12 +1214,7 @@ fun App(prefs: SharedPreferences) {
                         SyncPanel(ips, favC, favW) { saveAll() }
                     }
                 }
-                3 -> MusicTab(
-                    lm,
-                    bulbs.filter { online[it.first] != false }.map { it.second },
-                    themes
-                )
-                else -> LazyColumn(
+                2 -> LazyColumn(
                     lm,
                     contentPadding = PaddingValues(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -1087,6 +1252,16 @@ fun App(prefs: SharedPreferences) {
                         }
                     }
                 }
+                else -> {
+                }
+            }
+            MusicTab(
+                if (tab == 3) lm else Modifier.size(0.dp),
+                bulbs.filter { online[it.first] != false }.map { it.second },
+                themes
+            ) { a, m ->
+                musicActive = a
+                micOn = m
             }
         }
     }
@@ -1359,14 +1534,15 @@ fun BulbCard(
     onSave: () -> Unit,
     onRename: (String) -> Unit,
     onStatus: (Boolean) -> Unit,
-    onRemove: () -> Unit
+    onRemove: () -> Unit,
+    tick: Int = 0
 ) {
     val scope = rememberCoroutineScope()
     val c = remember { Ctl() }
     var editing by remember { mutableStateOf(false) }
     var draft by remember { mutableStateOf(name) }
 
-    LaunchedEffect(ip) {
+    LaunchedEffect(ip, tick) {
         val r = Wiz.query(ip)
         onStatus(r != null)
         r?.let {
